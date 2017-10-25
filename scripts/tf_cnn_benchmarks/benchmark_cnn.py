@@ -297,7 +297,7 @@ _DEFAULT_PARAMS = {
         _ParamSpec('string', 'parameter_server',
                    'The method for managing variables: parameter_server, '
                    'replicated, distributed_replicated, independent, '
-                   'distributed_all_reduce'),
+                   'distributed_all_reduce, horovod'),
     'all_reduce_spec':
         _ParamSpec('string', None,
                    'A specification of the all_reduce algorithm to be used for '
@@ -338,6 +338,10 @@ _DEFAULT_PARAMS = {
         _ParamSpec('string', 'grpc', 'protocol for servers'),
     'cross_replica_sync':
         _ParamSpec('boolean', True, ''),
+    'horovod_device':
+        _ParamSpec('string', '',
+                   'Device to do Horovod all-reduce on: empty (default), '
+                   'cpu or gpu'),
 
     # Summary and Save & load checkpoints.
     'summary_verbosity':
@@ -486,6 +490,9 @@ def create_config_proto(params):
   if params.xla:
     config.graph_options.optimizer_options.global_jit_level = (
         tf.OptimizerOptions.ON_1)
+  if params.variable_update == 'horovod':
+    import horovod.tensorflow as hvd
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
   return config
 
 
@@ -776,11 +783,14 @@ class BenchmarkCNN(object):
     ]
 
     if (self.params.staged_vars and
-        self.params.variable_update != 'parameter_server'):
+        self.params.variable_update != 'parameter_server' and
+        self.params.variable_update != 'horovod'):
       raise ValueError('staged_vars for now is only supported with '
-                       'variable_update=parameter_server')
+                       'variable_update=parameter_server or with'
+                       'variable_update=horovod')
 
-    if self.params.variable_update == 'parameter_server':
+    if (self.params.variable_update == 'parameter_server' or
+        self.params.variable_update == 'horovod'):
       if self.job_name:
         if not self.params.staged_vars:
           self.variable_mgr = variable_mgr.VariableMgrDistributedFetchFromPS(
@@ -832,6 +842,10 @@ class BenchmarkCNN(object):
     else:
       self.global_step_device = self.cpu_device
 
+    if self.params.variable_update == 'horovod':
+      import horovod.tensorflow as hvd
+      hvd.init()
+
     self.image_preprocessor = self.get_image_preprocessor()
     self.init_global_step = 0
 
@@ -864,6 +878,10 @@ class BenchmarkCNN(object):
     if single_session:
       device_list = self.raw_devices_across_tasks()
       num_workers = len(self.worker_hosts)
+    elif self.params.variable_update == 'horovod':
+      import horovod.tensorflow as hvd
+      device_list = ['horovod:%d' % idx for idx in range(hvd.size())]
+      num_workers = hvd.size()
     else:
       device_list = self.raw_devices
       num_workers = 1
@@ -884,6 +902,8 @@ class BenchmarkCNN(object):
       log_fn('Sync:        %s' % self.params.cross_replica_sync)
     if self.params.staged_vars:
       log_fn('Staged vars: %s' % self.params.staged_vars)
+    if self.params.variable_update == 'horovod' and self.params.horovod_device:
+      log_fn('Horovod on:  %s' % self.params.horovod_device)
     log_fn('==========')
 
   def run(self):
@@ -1033,8 +1053,14 @@ class BenchmarkCNN(object):
       variable_mgr_init_ops.extend(self.variable_mgr.get_post_init_ops())
     local_var_init_op_group = tf.group(*variable_mgr_init_ops)
 
-    summary_op = tf.summary.merge_all()
     is_chief = (not self.job_name or self.task_index == 0)
+    if self.params.variable_update == 'horovod':
+      import horovod.tensorflow as hvd
+      if hvd.rank() > 0:
+        # Only first worker can be chief.
+        is_chief = False
+
+    summary_op = tf.summary.merge_all()
     summary_writer = None
     if (is_chief and self.params.summary_verbosity and self.params.train_dir and
         self.params.save_summaries_steps > 0):
@@ -1068,8 +1094,14 @@ class BenchmarkCNN(object):
       # in replicated mode).
       ready_for_local_init_op = tf.report_uninitialized_variables(
           tf.global_variables())
+    if self.params.variable_update == 'horovod':
+      import horovod.tensorflow as hvd
+      bcast_global_variables_op = hvd.broadcast_global_variables(0)
+    else:
+      bcast_global_variables_op = None
     sv = tf.train.Supervisor(
-        is_chief=is_chief,
+        # For the purpose of Supervisor, all Horovod workers are 'chiefs'.
+        is_chief=is_chief or self.params.variable_update == 'horovod',
         logdir=self.params.train_dir,
         ready_for_local_init_op=ready_for_local_init_op,
         local_init_op=local_var_init_op_group,
@@ -1090,6 +1122,8 @@ class BenchmarkCNN(object):
         master=master_target,
         config=create_config_proto(self.params),
         start_standard_services=start_standard_services) as sess:
+      if bcast_global_variables_op:
+        sess.run(bcast_global_variables_op)
       image_producer = cnn_util.ImageProducer(sess, image_producer_ops,
                                               self.batch_group_size)
       image_producer.start()
@@ -1165,6 +1199,11 @@ class BenchmarkCNN(object):
         num_workers = len(self.worker_hosts)
         num_steps = local_step
         elapsed_time = loop_end_time - loop_start_time
+      elif self.params.variable_update == 'horovod':
+        import horovod.tensorflow as hvd
+        num_workers = hvd.size()
+        num_steps = global_step_watcher.num_steps()
+        elapsed_time = global_step_watcher.elapsed_time()
       else:
         num_workers = 1
         num_steps = global_step_watcher.num_steps()
@@ -1615,6 +1654,16 @@ class BenchmarkCNN(object):
         # optimizers square gradients and do other operations which might not be
         # compatible with modifying both the gradients and the learning rate.
         grads = [grad * (1. / self.loss_scale) for grad in grads]
+
+      if self.params.variable_update == 'horovod':
+        import horovod.tensorflow as hvd
+        if self.params.horovod_device:
+          horovod_device = '/%s:0' % self.params.horovod_device
+        else:
+          horovod_device = ''
+        # All-reduce gradients using Horovod.
+        grads = [hvd.allreduce(grad, device_dense=horovod_device)
+                 for grad in grads]
 
       if self.params.staged_vars:
         grad_dtypes = [grad.dtype for grad in grads]
